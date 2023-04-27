@@ -2984,11 +2984,11 @@ json_t *janus_audiobridge_query_session(janus_plugin_session *handle) {
 		json_object_set_new(info, "active", g_atomic_int_get(&participant->active) ? json_true() : json_false());
 		json_object_set_new(info, "pre-buffering", participant->prebuffering ? json_true() : json_false());
 		json_object_set_new(info, "prebuffer-count", json_integer(participant->prebuffer_count));
-		if(participant->inbuf) {
-			janus_mutex_lock(&participant->qmutex);
-			json_object_set_new(info, "queue-in", json_integer(g_list_length(participant->inbuf)));
-			janus_mutex_unlock(&participant->qmutex);
-		}
+		janus_mutex_lock(&participant->qmutex);
+		json_object_set_new(info, "buffer-in", json_integer(participant->audio_buffered_packets ?
+			participant->audio_buffered_packets->length : 0));
+		json_object_set_new(info, "queue-in", json_integer(g_list_length(participant->inbuf)));
+		janus_mutex_unlock(&participant->qmutex);
 		if(participant->outbuf)
 			json_object_set_new(info, "queue-out", json_integer(g_async_queue_length(participant->outbuf)));
 		if(participant->last_drop > 0)
