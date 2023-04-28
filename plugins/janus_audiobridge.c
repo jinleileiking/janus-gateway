@@ -1535,7 +1535,6 @@ typedef struct janus_audiobridge_participant {
 	gchar *user_id_str;		/* Unique ID in the room (when using strings) */
 	gchar *display;			/* Display name (opaque value, only meaningful to application) */
 	gboolean admin;			/* If the participant is an admin (can't be globally muted) */
-	gboolean prebuffering;	/* Whether this participant needs pre-buffering of a few packets (just joined) */
 	uint prebuffer_count;	/* Number of packets to buffer before decoding this participant */
 	volatile gint active;	/* Whether this participant can receive media at all */
 	volatile gint encoding;	/* Whether this participant is currently encoding */
@@ -1551,7 +1550,8 @@ typedef struct janus_audiobridge_participant {
 	GQueue *audio_buffered_packets;	/* Queue of incoming buffered audio packets */
 	GList *inbuf;			/* Incoming audio from this participant, as an ordered list of packets */
 	GAsyncQueue *outbuf;	/* Mixed audio for this participant */
-	gint64 last_drop;		/* When we last dropped a packet because the imcoming queue was full */
+	gint64 last_drop;		/* When we last dropped a packet because the incoming queue was full */
+	guint drop_pkt_count;	/* The number of packets dropped due to a full incoming queue */
 	janus_mutex qmutex;		/* Incoming queue mutex */
 	int opus_pt;			/* Opus payload type */
 	int extmap_id;			/* Audio level RTP extension id, if any */
@@ -1613,7 +1613,7 @@ typedef struct janus_audiobridge_buffer_packet {
 	/* Monotonic insert time */
 	int64_t inserted;
 } janus_audiobridge_buffer_packet;
-static janus_audiobridge_buffer_packet *janus_audiobridge_buffer_packet_create(char *buffer, int len) {
+static janus_audiobridge_buffer_packet *janus_audiobridge_buffer_packet_create(char *buffer, int len, gint64 now) {
 	janus_audiobridge_buffer_packet *pkt = g_malloc(sizeof(janus_audiobridge_buffer_packet));
 	pkt->buffer = g_malloc(len);
 	pkt->len = len;
@@ -1622,7 +1622,7 @@ static janus_audiobridge_buffer_packet *janus_audiobridge_buffer_packet_create(c
 	pkt->timestamp = ntohl(rtp->timestamp);
 	pkt->seq_number = ntohs(rtp->seq_number);
 	pkt->reset = FALSE;
-	pkt->inserted = janus_get_monotonic_time();
+	pkt->inserted = now;
 	return pkt;
 }
 static void janus_audiobridge_buffer_packet_destroy(janus_audiobridge_buffer_packet *pkt) {
@@ -1634,63 +1634,22 @@ static void janus_audiobridge_buffer_packet_destroy(janus_audiobridge_buffer_pac
 static gint janus_audiobridge_buffer_packet_compare(gconstpointer a, gconstpointer b, gpointer user_data) {
 	janus_audiobridge_buffer_packet *bpa = (janus_audiobridge_buffer_packet *)a;
 	janus_audiobridge_buffer_packet *bpb = (janus_audiobridge_buffer_packet *)b;
-	if(bpa->timestamp == bpb->timestamp) {
-		/* Check the sequence numbers */
-		if(bpa->seq_number == bpb->seq_number) {
-			/* Same packet? */
-			return 0;
-		} else if(bpa->seq_number < bpb->seq_number) {
-			if(bpb->seq_number - bpa->seq_number < 30000) {
-				/* Sequence number wrapped */
-				return -1;
-			} else {
-				/* Regular ordering */
-				return 1;
-			}
-		} else if(bpa->seq_number > bpb->seq_number) {
-			if(bpa->seq_number - bpb->seq_number < 30000) {
-				/* Sequence number wrapped */
-				return 1;
-			} else {
-				/* Regular ordering */
-				return -1;
-			}
+	int32_t diff = (int32_t)(bpa->seq_number - bpb->seq_number);
+	if(diff < 0) {
+		/* seq num A < seq num B */
+		if (bpa->inserted > bpb->inserted) {
+			bpa->inserted = bpb->inserted;
 		}
-	} else if(bpa->timestamp < bpb->timestamp) {
-		if(bpb->timestamp - bpa->timestamp < 2*1000*1000*1000) {
-			/* Timestamp wrapped */
-			return -1;
-		} else {
-			/* Regular ordering */
-			return 1;
+		return -1;
+	}
+	if(diff > 0) {
+		/* seq num A > seq num B */
+		if (bpb->inserted > bpa->inserted) {
+			bpb->inserted = bpa->inserted;
 		}
-	} else if(bpa->timestamp > bpb->timestamp) {
-		if(bpa->timestamp - bpb->timestamp < 2*1000*1000*1000) {
-			/* Timestamp wrapped */
-			return 1;
-		} else {
-			/* Regular ordering */
-			return -1;
-		}
+		return 1;
 	}
 	return 0;
-}
-
-/* Check if the RTP packet is out of order */
-static gboolean janus_audiobridge_rtp_is_outoforder(janus_rtp_header *header, janus_audiobridge_participant *p) {
-	if(header == NULL || p == NULL)
-		return FALSE;
-	uint16_t seq = ntohs(header->seq_number);
-	if((int16_t)(seq - p->a_max_seq_nr) > 0) {
-		/* Packet is in order, update max_seq_nr */
-		p->a_max_seq_nr = seq;
-		return FALSE;
-	} else {
-		/* Packet is out of order */
-		JANUS_LOG(LOG_WARN, "Out of order packet (%"SCNu16", expecting %"SCNu16")\n",
-			seq, (p->a_max_seq_nr+1));
-		return TRUE;
-	}
 }
 
 static void janus_audiobridge_participant_destroy(janus_audiobridge_participant *participant) {
@@ -1938,26 +1897,6 @@ static guint32 janus_audiobridge_rtp_forwarder_add_helper(janus_audiobridge_room
 		room->room_id_str, host, port, actual_stream_id);
 
 	return actual_stream_id;
-}
-
-
-/* Helper to sort incoming RTP packets by sequence numbers */
-static gint janus_audiobridge_rtp_sort(gconstpointer a, gconstpointer b) {
-	janus_audiobridge_rtp_relay_packet *pkt1 = (janus_audiobridge_rtp_relay_packet *)a;
-	janus_audiobridge_rtp_relay_packet *pkt2 = (janus_audiobridge_rtp_relay_packet *)b;
-	if(pkt1->seq_number < 100 && pkt2->seq_number > 65000) {
-		/* Sequence number was probably reset, pkt2 is older */
-		return 1;
-	} else if(pkt2->seq_number < 100 && pkt1->seq_number > 65000) {
-		/* Sequence number was probably reset, pkt1 is older */
-		return -1;
-	}
-	/* Simply compare timestamps */
-	if(pkt1->seq_number < pkt2->seq_number)
-		return -1;
-	else if(pkt1->seq_number > pkt2->seq_number)
-		return 1;
-	return 0;
 }
 
 /* Helper struct to generate and parse WAVE headers */
@@ -2982,7 +2921,6 @@ json_t *janus_audiobridge_query_session(janus_plugin_session *handle) {
 			json_object_set_new(info, "admin", json_true());
 		json_object_set_new(info, "muted", participant->muted ? json_true() : json_false());
 		json_object_set_new(info, "active", g_atomic_int_get(&participant->active) ? json_true() : json_false());
-		json_object_set_new(info, "pre-buffering", participant->prebuffering ? json_true() : json_false());
 		json_object_set_new(info, "prebuffer-count", json_integer(participant->prebuffer_count));
 		janus_mutex_lock(&participant->qmutex);
 		json_object_set_new(info, "buffer-in", json_integer(participant->audio_buffered_packets ?
@@ -2991,6 +2929,7 @@ json_t *janus_audiobridge_query_session(janus_plugin_session *handle) {
 		janus_mutex_unlock(&participant->qmutex);
 		if(participant->outbuf)
 			json_object_set_new(info, "queue-out", json_integer(g_async_queue_length(participant->outbuf)));
+		json_object_set_new(info, "drop-count", json_integer(participant->drop_pkt_count));
 		if(participant->last_drop > 0)
 			json_object_set_new(info, "last-drop", json_integer(participant->last_drop));
 		if(participant->stereo)
@@ -3781,6 +3720,7 @@ static json_t *janus_audiobridge_process_synchronous_request(janus_audiobridge_s
 				/* Get rid of queued packets */
 				janus_mutex_lock(&p->qmutex);
 				g_atomic_int_set(&p->active, 0);
+				g_queue_clear_full(p->audio_buffered_packets, (GDestroyNotify)janus_audiobridge_buffer_packet_destroy);
 				while(p->inbuf) {
 					GList *first = g_list_first(p->inbuf);
 					janus_audiobridge_rtp_relay_packet *pkt = (janus_audiobridge_rtp_relay_packet *)first->data;
@@ -4240,6 +4180,7 @@ static json_t *janus_audiobridge_process_synchronous_request(janus_audiobridge_s
 				participant->muted ? "true" : "false", participant->room->room_id_str, participant->user_id_str);
 			/* Clear the queued packets waiting to be handled */
 			janus_mutex_lock(&participant->qmutex);
+			g_queue_clear_full(participant->audio_buffered_packets, (GDestroyNotify)janus_audiobridge_buffer_packet_destroy);
 			while(participant->inbuf) {
 				GList *first = g_list_first(participant->inbuf);
 				janus_audiobridge_rtp_relay_packet *pkt = (janus_audiobridge_rtp_relay_packet *)first->data;
@@ -5588,6 +5529,7 @@ void janus_audiobridge_incoming_rtp(janus_plugin_session *handle, janus_plugin_r
 		return;
 	if(participant->room && participant->room->muted && !participant->admin)
 		return;
+	gint64 now = janus_get_monotonic_time();
 	char *buf = packet->buffer;
 	uint16_t len = packet->length;
 	/* Save the frame if we're recording this leg */
@@ -5619,25 +5561,10 @@ void janus_audiobridge_incoming_rtp(janus_plugin_session *handle, janus_plugin_r
 			return;
 		}
 		/* Queue the audio packet (we won't decode now, there might be buffering involved) */
-		janus_audiobridge_buffer_packet *pkt = janus_audiobridge_buffer_packet_create(buf, len);
+		janus_audiobridge_buffer_packet *pkt = janus_audiobridge_buffer_packet_create(buf, len, now);
 		pkt->reset = FALSE;	/* FIXME */
 		janus_mutex_lock(&participant->qmutex);
 		g_queue_insert_sorted(participant->audio_buffered_packets, pkt, (GCompareDataFunc)janus_audiobridge_buffer_packet_compare, NULL);
-		/* If this packet is out-of-order, fix the inserted time */
-		if(janus_audiobridge_rtp_is_outoforder(rtp, participant)) {
-			/* Out of order */
-			GList *item = g_queue_find(participant->audio_buffered_packets, pkt);
-			janus_audiobridge_buffer_packet *prev = NULL;
-			if(item && item->prev && item->prev->data)
-				prev = (janus_audiobridge_buffer_packet *)item->prev->data;
-			else if(item && item->next && item->next->data)
-				prev = (janus_audiobridge_buffer_packet *)item->next->data;
-			if(prev != NULL) {
-				JANUS_LOG(LOG_HUGE, " >> Fixing inserted time: %"SCNi64" --> %"SCNi64"\n",
-					pkt->inserted, prev->inserted);
-				pkt->inserted = prev->inserted;
-			}
-		}
 		janus_mutex_unlock(&participant->qmutex);
 		/* Check the audio levels, in case we need to notify participants about who's talking */
 		if(participant->extmap_id > 0) {
@@ -5834,7 +5761,6 @@ static void janus_audiobridge_hangup_media_internal(janus_plugin_session *handle
 	participant->muted = TRUE;
 	g_free(participant->display);
 	participant->display = NULL;
-	participant->prebuffering = TRUE;
 	/* Make sure we're not using the encoder/decoder right now, we're going to destroy them */
 	while(!g_atomic_int_compare_and_exchange(&participant->encoding, 0, 1))
 		g_usleep(5000);
@@ -5855,6 +5781,7 @@ static void janus_audiobridge_hangup_media_internal(janus_plugin_session *handle
 	g_free(participant->mjr_base);
 	participant->mjr_base = NULL;
 	/* Get rid of queued packets */
+	g_queue_clear_full(participant->audio_buffered_packets, (GDestroyNotify)janus_audiobridge_buffer_packet_destroy);
 	while(participant->inbuf) {
 		GList *first = g_list_first(participant->inbuf);
 		janus_audiobridge_rtp_relay_packet *pkt = (janus_audiobridge_rtp_relay_packet *)first->data;
@@ -5868,6 +5795,7 @@ static void janus_audiobridge_hangup_media_internal(janus_plugin_session *handle
 		pkt = NULL;
 	}
 	participant->last_drop = 0;
+	participant->drop_pkt_count = 0;
 	janus_mutex_unlock(&participant->qmutex);
 	if(audiobridge != NULL) {
 		janus_mutex_unlock(&audiobridge->mutex);
@@ -6197,12 +6125,12 @@ static void *janus_audiobridge_handler(void *data) {
 				janus_refcount_init(&participant->ref, janus_audiobridge_participant_free);
 				g_atomic_int_set(&participant->active, 0);
 				participant->codec = codec;
-				participant->prebuffering = TRUE;
 				participant->display = NULL;
 				participant->inbuf = NULL;
 				participant->audio_buffered_packets = g_queue_new();
 				participant->outbuf = NULL;
 				participant->last_drop = 0;
+				participant->drop_pkt_count = 0;
 				participant->encoder = NULL;
 				participant->decoder = NULL;
 				participant->reset = FALSE;
@@ -6582,9 +6510,6 @@ static void *janus_audiobridge_handler(void *data) {
 							g_free(pkt->data);
 							g_free(pkt);
 						}
-					} else {
-						/* Reset the prebuffering state */
-						participant->prebuffering = TRUE;
 					}
 					participant->prebuffer_count = prebuffer_count;
 					janus_mutex_unlock(&participant->qmutex);
@@ -6645,6 +6570,7 @@ static void *janus_audiobridge_handler(void *data) {
 					if(participant->muted) {
 						/* Clear the queued packets waiting to be handled */
 						janus_mutex_lock(&participant->qmutex);
+						g_queue_clear_full(participant->audio_buffered_packets, (GDestroyNotify)janus_audiobridge_buffer_packet_destroy);
 						while(participant->inbuf) {
 							GList *first = g_list_first(participant->inbuf);
 							janus_audiobridge_rtp_relay_packet *pkt = (janus_audiobridge_rtp_relay_packet *)first->data;
@@ -6980,7 +6906,6 @@ static void *janus_audiobridge_handler(void *data) {
 				}
 				JANUS_LOG(LOG_VERB, "  -- Participant ID in new room %s: %s\n", room_id_str, user_id_str);
 			}
-			participant->prebuffering = TRUE;
 			participant->audio_active_packets = 0;
 			participant->audio_dBov_sum = 0;
 			participant->talking = FALSE;
@@ -7264,7 +7189,7 @@ static void *janus_audiobridge_handler(void *data) {
 			/* Get rid of queued packets */
 			janus_mutex_lock(&participant->qmutex);
 			g_atomic_int_set(&participant->active, 0);
-			participant->prebuffering = TRUE;
+			g_queue_clear_full(participant->audio_buffered_packets, (GDestroyNotify)janus_audiobridge_buffer_packet_destroy);
 			while(participant->inbuf) {
 				GList *first = g_list_first(participant->inbuf);
 				janus_audiobridge_rtp_relay_packet *pkt = (janus_audiobridge_rtp_relay_packet *)first->data;
@@ -7823,7 +7748,7 @@ static void *janus_audiobridge_mixer_thread(void *data) {
 		while(ps) {
 			janus_audiobridge_participant *p = (janus_audiobridge_participant *)ps->data;
 			janus_mutex_lock(&p->qmutex);
-			if(g_atomic_int_get(&p->destroyed) || !p->session || !g_atomic_int_get(&p->session->started) || !g_atomic_int_get(&p->active) || p->muted || p->prebuffering || !p->inbuf) {
+			if(g_atomic_int_get(&p->destroyed) || !p->session || !g_atomic_int_get(&p->session->started) || !g_atomic_int_get(&p->active) || p->muted || !p->inbuf) {
 				janus_mutex_unlock(&p->qmutex);
 				ps = ps->next;
 				continue;
@@ -8074,7 +7999,7 @@ static void *janus_audiobridge_mixer_thread(void *data) {
 			}
 			janus_audiobridge_rtp_relay_packet *pkt = NULL;
 			janus_mutex_lock(&p->qmutex);
-			if(g_atomic_int_get(&p->active) && !p->muted && !p->prebuffering && p->inbuf) {
+			if(g_atomic_int_get(&p->active) && !p->muted && p->inbuf) {
 				GList *first = g_list_first(p->inbuf);
 				pkt = (janus_audiobridge_rtp_relay_packet *)(first ? first->data : NULL);
 				p->inbuf = g_list_delete_link(p->inbuf, first);
@@ -8348,7 +8273,7 @@ static void *janus_audiobridge_participant_thread(void *data) {
 		janus_mutex_lock(&participant->qmutex);
 		gboolean locked = TRUE;
 		bpkt = participant->audio_buffered_packets ? g_queue_peek_head(participant->audio_buffered_packets) : NULL;
-		while(bpkt != NULL && ((now - bpkt->inserted) >= participant->prebuffer_count*20)) {
+		while(bpkt != NULL && (g_queue_get_length(participant->audio_buffered_packets) >= participant->prebuffer_count || (now - bpkt->inserted) >= (participant->prebuffer_count * 20 * 1000))) {
 			bpkt = g_queue_pop_head(participant->audio_buffered_packets);
 			janus_mutex_unlock(&participant->qmutex);
 			locked = FALSE;
@@ -8421,37 +8346,28 @@ static void *janus_audiobridge_participant_thread(void *data) {
 			janus_mutex_lock(&participant->qmutex);
 			locked = TRUE;
 			participant->inbuf = g_list_append(participant->inbuf, pkt);
-			if(participant->prebuffering) {
-				/* Still pre-buffering: do we have enough packets now? */
-				if(g_list_length(participant->inbuf) > participant->prebuffer_count) {
-					participant->prebuffering = FALSE;
-					JANUS_LOG(LOG_VERB, "Prebuffering done! Finally adding the user to the mix\n");
-				} else {
-					JANUS_LOG(LOG_VERB, "Still prebuffering (got %d packets), not adding the user to the mix yet\n", g_list_length(participant->inbuf));
+			/* Make sure we're not queueing too many packets: if so, get rid of the older ones */
+			if(g_list_length(participant->inbuf) > participant->prebuffer_count*2) {
+				if(now - participant->last_drop > 5*G_USEC_PER_SEC) {
+					JANUS_LOG(LOG_VERB, "Too many packets in queue (%d > %d), removing older ones\n",
+						g_list_length(participant->inbuf), participant->prebuffer_count*2);
+					participant->last_drop = now;
 				}
-			} else {
-				/* Make sure we're not queueing too many packets: if so, get rid of the older ones */
-				if(g_list_length(participant->inbuf) >= participant->prebuffer_count*2) {
-					if(now - participant->last_drop > 5*G_USEC_PER_SEC) {
-						JANUS_LOG(LOG_VERB, "Too many packets in queue (%d > %d), removing older ones\n",
-							g_list_length(participant->inbuf), participant->prebuffer_count*2);
-						participant->last_drop = now;
-					}
-					while(g_list_length(participant->inbuf) > participant->prebuffer_count) {
-						/* Remove this packet: it's too old */
-						GList *first = g_list_first(participant->inbuf);
-						janus_audiobridge_rtp_relay_packet *pkt = (janus_audiobridge_rtp_relay_packet *)first->data;
-						JANUS_LOG(LOG_VERB, "List length = %d, Remove sequence = %d\n",
-							g_list_length(participant->inbuf), pkt->seq_number);
-						participant->inbuf = g_list_delete_link(participant->inbuf, first);
-						first = NULL;
-						if(pkt == NULL)
-							continue;
-						g_free(pkt->data);
-						pkt->data = NULL;
-						g_free(pkt);
-						pkt = NULL;
-					}
+				while(g_list_length(participant->inbuf) > participant->prebuffer_count) {
+					/* Remove this packet: it's too old */
+					GList *first = g_list_first(participant->inbuf);
+					janus_audiobridge_rtp_relay_packet *pkt = (janus_audiobridge_rtp_relay_packet *)first->data;
+					JANUS_LOG(LOG_VERB, "List length = %d, Remove sequence = %d\n",
+						g_list_length(participant->inbuf), pkt->seq_number);
+					participant->inbuf = g_list_delete_link(participant->inbuf, first);
+					first = NULL;
+					if(pkt == NULL)
+						continue;
+					g_free(pkt->data);
+					pkt->data = NULL;
+					g_free(pkt);
+					pkt = NULL;
+					participant->drop_pkt_count++;
 				}
 			}
 			/* Peek the next packet */
@@ -8520,9 +8436,8 @@ static void *janus_audiobridge_participant_thread(void *data) {
 		if(mixedpkt) {
 			g_free(mixedpkt->data);
 			g_free(mixedpkt);
-		} else {
-			g_usleep(1000);
 		}
+		g_usleep(2500);
 	}
 	/* We're done, get rid of the resources */
 	g_free(outpkt->data);
