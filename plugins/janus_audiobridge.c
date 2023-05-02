@@ -1610,10 +1610,12 @@ typedef struct janus_audiobridge_buffer_packet {
 	uint16_t seq_number;
 	/* Hint to reset decoder (e.g., after an SSRC change) */
 	gboolean reset;
+	/* RTP clock in khz */
+	int64_t rtp_clock_khz;
 	/* Monotonic insert time */
 	int64_t inserted;
 } janus_audiobridge_buffer_packet;
-static janus_audiobridge_buffer_packet *janus_audiobridge_buffer_packet_create(char *buffer, int len, gint64 now) {
+static janus_audiobridge_buffer_packet *janus_audiobridge_buffer_packet_create(char *buffer, int len, gint64 rtp_clock_khz, gint64 now) {
 	janus_audiobridge_buffer_packet *pkt = g_malloc(sizeof(janus_audiobridge_buffer_packet));
 	pkt->buffer = g_malloc(len);
 	pkt->len = len;
@@ -1622,6 +1624,7 @@ static janus_audiobridge_buffer_packet *janus_audiobridge_buffer_packet_create(c
 	pkt->timestamp = ntohl(rtp->timestamp);
 	pkt->seq_number = ntohs(rtp->seq_number);
 	pkt->reset = FALSE;
+	pkt->rtp_clock_khz = rtp_clock_khz;
 	pkt->inserted = now;
 	return pkt;
 }
@@ -1639,16 +1642,24 @@ static gint janus_audiobridge_buffer_packet_compare(gconstpointer a, gconstpoint
 		diff = -diff;
 		/* seq num A < seq num B */
 		if (bpa->inserted > bpb->inserted) {
+			int64_t rtp_diff = (int64_t)(bpa->timestamp - bpb->timestamp);
+			if(rtp_diff < 0)
+				rtp_diff = -rtp_diff;
+			int64_t rtp_diff_us = (rtp_diff * 1000) / bpa->rtp_clock_khz;
 			/* out of order packets (A is late)*/
-			bpa->inserted = bpb->inserted - (diff * 20 * 1000);
+			bpa->inserted = bpb->inserted - rtp_diff_us;
 		}
 		return -1;
 	}
 	if(diff > 0) {
 		/* seq num A > seq num B */
 		if (bpb->inserted > bpa->inserted) {
+			int64_t rtp_diff = (int64_t)(bpa->timestamp - bpb->timestamp);
+			if(rtp_diff < 0)
+				rtp_diff = -rtp_diff;
+			int64_t rtp_diff_us = (rtp_diff * 1000) / bpa->rtp_clock_khz;
 			/* out of order packets (B is late)*/
-			bpb->inserted = bpa->inserted - (diff * 20 * 1000);
+			bpb->inserted = bpa->inserted - rtp_diff_us;
 		}
 		return 1;
 	}
@@ -5572,7 +5583,10 @@ void janus_audiobridge_incoming_rtp(janus_plugin_session *handle, janus_plugin_r
 			return;
 		}
 		/* Queue the audio packet (we won't decode now, there might be buffering involved) */
-		janus_audiobridge_buffer_packet *pkt = janus_audiobridge_buffer_packet_create(buf, len, now);
+		gint64 rtp_clock_khz = 48;
+		if(participant->codec == JANUS_AUDIOCODEC_PCMA || participant->codec == JANUS_AUDIOCODEC_PCMU)
+			rtp_clock_khz = 8;
+		janus_audiobridge_buffer_packet *pkt = janus_audiobridge_buffer_packet_create(buf, len, rtp_clock_khz, now);
 		pkt->reset = FALSE;	/* FIXME */
 		g_queue_insert_sorted(participant->audio_buffered_packets, pkt, (GCompareDataFunc)janus_audiobridge_buffer_packet_compare, NULL);
 		janus_mutex_unlock(&participant->qmutex);
