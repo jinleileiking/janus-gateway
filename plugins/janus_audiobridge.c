@@ -8225,10 +8225,10 @@ static void *janus_audiobridge_participant_thread(void *data) {
 						pkt->seq_number = participant->expected_seq;		/* FIXME */
 						/* This is a redundant packet, so we can't parse any extension info */
 						pkt->silence = FALSE;
-						/* First, decode the next packet (bpkt) using fec=1 */
-						pkt->length = opus_decode(participant->decoder, payload, plen, (opus_int16 *)pkt->data, BUFFER_SAMPLES, 1);
-						/* Pass NULL to the decoder to use FEC */
-						pkt->length = opus_decode(participant->decoder, NULL, plen, (opus_int16 *)pkt->data, BUFFER_SAMPLES, 1);
+						/* Decode the lost packet using fec=1 */
+						int32_t output_samples;
+						opus_decoder_ctl(participant->decoder, OPUS_GET_LAST_PACKET_DURATION(&output_samples));
+						pkt->length = opus_decode(participant->decoder, payload, plen, (opus_int16 *)pkt->data, output_samples, 1);
 						/* Queue the decoded redundant packet for the mixer */
 						janus_mutex_lock(&participant->qmutex);
 						participant->inbuf = g_list_append(participant->inbuf, pkt);
