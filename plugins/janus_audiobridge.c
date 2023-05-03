@@ -8172,7 +8172,7 @@ static void *janus_audiobridge_participant_thread(void *data) {
 	janus_audiobridge_rtp_relay_packet *mixedpkt = NULL;
 	janus_rtp_header *rtp = NULL;
 	gint64 now = janus_get_monotonic_time(), before = now;
-	//~ gboolean first = TRUE, use_fec = FALSE;
+	gboolean first = TRUE, use_fec = FALSE;
 	int ret = 0;
 
 	/* Start working: check both the incoming queue (to decode and queue) and the outgoing one (to encode and send) */
@@ -8190,17 +8190,17 @@ static void *janus_audiobridge_participant_thread(void *data) {
 				if(ret == JITTER_BUFFER_OK) {
 					bpkt = (janus_audiobridge_buffer_packet *)jbp.data;
 					janus_mutex_unlock(&participant->qmutex);
-					//~ first = FALSE;
+					first = FALSE;
 					locked = FALSE;
 					rtp = (janus_rtp_header *)bpkt->buffer;
-					//~ /* If this is Opus, check if there's a packet gap we should fix with FEC */
-					//~ use_fec = FALSE;
-					//~ if(!first && participant->codec == JANUS_AUDIOCODEC_OPUS && participant->fec) {
-						//~ if(ntohs(rtp->seq_number) != participant->expected_seq) {
-							//~ /* Lost a packet here? Use FEC to recover */
-							//~ use_fec = TRUE;
-						//~ }
-					//~ }
+					/* If this is Opus, check if there's a packet gap we should fix with FEC */
+					use_fec = FALSE;
+					if(!first && participant->codec == JANUS_AUDIOCODEC_OPUS && participant->fec) {
+						if(ntohs(rtp->seq_number) != participant->expected_seq) {
+							/* Lost a packet here? Use FEC to recover */
+							use_fec = TRUE;
+						}
+					}
 					if(!g_atomic_int_compare_and_exchange(&participant->decoding, 0, 1)) {
 						/* This means we're cleaning up, so don't try to decode */
 						janus_audiobridge_buffer_packet_destroy(bpkt);
@@ -8216,25 +8216,25 @@ static void *janus_audiobridge_participant_thread(void *data) {
 						janus_audiobridge_buffer_packet_destroy(bpkt);
 						break;
 					}
-					//~ if(use_fec) {
-						//~ /* There was a gap, try to get decode from redundant info first */
-						//~ pkt = g_malloc(sizeof(janus_audiobridge_rtp_relay_packet));
-						//~ pkt->data = g_malloc0(BUFFER_SAMPLES*sizeof(opus_int16));
-						//~ pkt->ssrc = 0;
-						//~ pkt->timestamp = participant->last_timestamp + 960;	/* FIXME */
-						//~ pkt->seq_number = participant->expected_seq;		/* FIXME */
-						//~ /* This is a redundant packet, so we can't parse any extension info */
-						//~ pkt->silence = FALSE;
-						//~ /* First, decode the next packet (bpkt) using fec=1 */
-						//~ pkt->length = opus_decode(participant->decoder, payload, plen, (opus_int16 *)pkt->data, BUFFER_SAMPLES, 1);
-						//~ /* Pass NULL to the decoder to use FEC */
-						//~ pkt->length = opus_decode(participant->decoder, NULL, plen, (opus_int16 *)pkt->data, BUFFER_SAMPLES, 1);
-						//~ /* Queue the decoded redundant packet for the mixer */
-						//~ janus_mutex_lock(&participant->qmutex);
-						//~ participant->inbuf = g_list_append(participant->inbuf, pkt);
-						//~ janus_mutex_unlock(&participant->qmutex);
-						//~ /* Now we can process the next packet */
-					//~ }
+					if(use_fec) {
+						/* There was a gap, try to get decode from redundant info first */
+						pkt = g_malloc(sizeof(janus_audiobridge_rtp_relay_packet));
+						pkt->data = g_malloc0(BUFFER_SAMPLES*sizeof(opus_int16));
+						pkt->ssrc = 0;
+						pkt->timestamp = participant->last_timestamp + 960;	/* FIXME */
+						pkt->seq_number = participant->expected_seq;		/* FIXME */
+						/* This is a redundant packet, so we can't parse any extension info */
+						pkt->silence = FALSE;
+						/* First, decode the next packet (bpkt) using fec=1 */
+						pkt->length = opus_decode(participant->decoder, payload, plen, (opus_int16 *)pkt->data, BUFFER_SAMPLES, 1);
+						/* Pass NULL to the decoder to use FEC */
+						pkt->length = opus_decode(participant->decoder, NULL, plen, (opus_int16 *)pkt->data, BUFFER_SAMPLES, 1);
+						/* Queue the decoded redundant packet for the mixer */
+						janus_mutex_lock(&participant->qmutex);
+						participant->inbuf = g_list_append(participant->inbuf, pkt);
+						janus_mutex_unlock(&participant->qmutex);
+						/* Now we can process the next packet */
+					}
 					/* Decode the packet */
 					pkt = g_malloc(sizeof(janus_audiobridge_rtp_relay_packet));
 					pkt->data = g_malloc0(BUFFER_SAMPLES*sizeof(opus_int16));
