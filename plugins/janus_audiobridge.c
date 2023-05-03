@@ -38,7 +38,6 @@ room-<unique room ID>: {
 	audiolevel_event = true|false (whether to emit event to other users or not, default=false)
 	audio_active_packets = 100 (number of packets with audio level, default=100, 2 seconds)
 	audio_level_average = 25 (average value of audio level, 127=muted, 0='too loud', default=25)
-	default_prebuffering = number of packets to buffer before decoding each participant (default=DEFAULT_PREBUFFERING)
 	default_expectedloss = percent of packets we expect participants may miss, to help with FEC (default=0, max=20; automatically used for forwarders too)
 	default_bitrate = default bitrate in bps to use for the all participants (default=0, which means libopus decides; automatically used for forwarders too)
 	record = true|false (whether this room should be recorded, default=false)
@@ -141,7 +140,6 @@ room-<unique room ID>: {
 	"audiolevel_event" : <true|false (whether to emit event to other users or not)>,
 	"audio_active_packets" : <number of packets with audio level (default=100, 2 seconds)>,
 	"audio_level_average" : <average value of audio level (127=muted, 0='too loud', default=25)>,
-	"default_prebuffering" : <number of packets to buffer before decoding each participant (default=DEFAULT_PREBUFFERING)>,
 	"default_expectedloss" : <percent of packets we expect participants may miss, to help with FEC (default=0, max=20; automatically used for forwarders too)>,
 	"default_bitrate" : <bitrate in bps to use for the all participants (default=0, which means libopus decides; automatically used for forwarders too)>,
 	"record" : <true|false, whether to record the room or not, default=false>,
@@ -716,7 +714,6 @@ room-<unique room ID>: {
 	"token" : "<invitation token, in case the room has an ACL; optional>",
 	"muted" : <true|false, whether to start unmuted or muted>,
 	"codec" : "<codec to use, among opus (default), pcma (A-Law) or pcmu (mu-Law)>",
-	"prebuffer" : <number of packets to buffer before decoding this participant (default=room value, or DEFAULT_PREBUFFERING)>,
 	"bitrate" : <bitrate to use for the Opus stream in bps; optional, default=0 (libopus decides)>,
 	"quality" : <0-10, Opus-related complexity to use, the higher the value, the better the quality (but more CPU); optional, default is 4>,
 	"expected_loss" : <0-20, a percentage of the expected loss (capped at 20%), only needed in case FEC is used; optional, default is 0 (FEC disabled even when negotiated) or the room default>,
@@ -804,7 +801,6 @@ room-<unique room ID>: {
 	"request" : "configure",
 	"muted" : <true|false, whether to unmute or mute>,
 	"display" : "<new display name to have in the room>",
-	"prebuffer" : <new number of packets to buffer before decoding this participant (see "join" for more info)>,
 	"bitrate" : <new bitrate to use for the Opus stream (see "join" for more info)>,
 	"quality" : <new Opus-related complexity to use (see "join" for more info)>,
 	"expected_loss" : <new value for the expected loss (see "join" for more info)>
@@ -1152,7 +1148,6 @@ static struct janus_json_parameter create_parameters[] = {
 	{"audiolevel_event", JANUS_JSON_BOOL, 0},
 	{"audio_active_packets", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"audio_level_average", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
-	{"default_prebuffering", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"default_expectedloss", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"default_bitrate", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"groups", JSON_ARRAY, 0}
@@ -1184,7 +1179,6 @@ static struct janus_json_parameter join_parameters[] = {
 	{"group", JSON_STRING, 0},
 	{"muted", JANUS_JSON_BOOL, 0},
 	{"codec", JSON_STRING, 0},
-	{"prebuffer", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"bitrate", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"quality", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"expected_loss", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
@@ -1216,7 +1210,6 @@ static struct janus_json_parameter rtp_parameters[] = {
 };
 static struct janus_json_parameter configure_parameters[] = {
 	{"muted", JANUS_JSON_BOOL, 0},
-	{"prebuffer", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"bitrate", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"quality", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"expected_loss", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
@@ -1307,7 +1300,6 @@ typedef struct janus_audiobridge_room {
 	gboolean spatial_audio;		/* Whether the mix will use spatial audio, using stereo */
 	gboolean audiolevel_ext;	/* Whether the ssrc-audio-level extension must be negotiated or not for new joins */
 	gboolean audiolevel_event;	/* Whether to emit event to other users about audiolevel */
-	uint default_prebuffering;	/* Number of packets to buffer before decoding each participant */
 	uint default_expectedloss;	/* Percent of packets we expect participants may miss, to help with FEC: can be overridden per-participant */
 	int32_t default_bitrate;	/* Default bitrate to use for all Opus streams when encoding */
 	int audio_active_packets;	/* Amount of packets with audio level for checkup */
@@ -1537,7 +1529,6 @@ typedef struct janus_audiobridge_participant {
 	gchar *user_id_str;		/* Unique ID in the room (when using strings) */
 	gchar *display;			/* Display name (opaque value, only meaningful to application) */
 	gboolean admin;			/* If the participant is an admin (can't be globally muted) */
-	uint prebuffer_count;	/* Number of packets to buffer before decoding this participant */
 	volatile gint active;	/* Whether this participant can receive media at all */
 	volatile gint encoding;	/* Whether this participant is currently encoding */
 	volatile gint decoding;	/* Whether this participant is currently decoding */
@@ -2060,11 +2051,6 @@ static int janus_audiobridge_resample(int16_t *input, int input_num, int input_r
 }
 
 
-/* Mixer settings */
-#define DEFAULT_PREBUFFERING	6
-#define MAX_PREBUFFERING		50
-
-
 /* Opus settings */
 #define	OPUS_SAMPLES	960
 #define	G711_SAMPLES	160
@@ -2452,7 +2438,6 @@ int janus_audiobridge_init(janus_callbacks *callback, const char *config_path) {
 			janus_config_item *audiolevel_event = janus_config_get(config, cat, janus_config_type_item, "audiolevel_event");
 			janus_config_item *audio_active_packets = janus_config_get(config, cat, janus_config_type_item, "audio_active_packets");
 			janus_config_item *audio_level_average = janus_config_get(config, cat, janus_config_type_item, "audio_level_average");
-			janus_config_item *default_prebuffering = janus_config_get(config, cat, janus_config_type_item, "default_prebuffering");
 			janus_config_item *default_expectedloss = janus_config_get(config, cat, janus_config_type_item, "default_expectedloss");
 			janus_config_item *default_bitrate = janus_config_get(config, cat, janus_config_type_item, "default_bitrate");
 			janus_config_item *secret = janus_config_get(config, cat, janus_config_type_item, "secret");
@@ -2550,15 +2535,6 @@ int janus_audiobridge_init(janus_callbacks *callback, const char *config_path) {
 					} else {
 						JANUS_LOG(LOG_WARN, "Invalid audio_level_average value provided, using default: %d\n", audiobridge->audio_level_average);
 					}
-				}
-			}
-			audiobridge->default_prebuffering = DEFAULT_PREBUFFERING;
-			if(default_prebuffering != NULL && default_prebuffering->value != NULL) {
-				int prebuffering = atoi(default_prebuffering->value);
-				if(prebuffering < 0 || prebuffering > MAX_PREBUFFERING) {
-					JANUS_LOG(LOG_WARN, "Invalid default_prebuffering value provided, using default: %d\n", audiobridge->default_prebuffering);
-				} else {
-					audiobridge->default_prebuffering = prebuffering;
 				}
 			}
 			audiobridge->default_expectedloss = 0;
@@ -2893,7 +2869,6 @@ json_t *janus_audiobridge_query_session(janus_plugin_session *handle) {
 			json_object_set_new(info, "admin", json_true());
 		json_object_set_new(info, "muted", participant->muted ? json_true() : json_false());
 		json_object_set_new(info, "active", g_atomic_int_get(&participant->active) ? json_true() : json_false());
-		json_object_set_new(info, "prebuffer-count", json_integer(participant->prebuffer_count));
 		janus_mutex_lock(&participant->qmutex);
 		spx_int32_t count = 0;
 		if(participant->jitter)
@@ -3039,7 +3014,6 @@ static json_t *janus_audiobridge_process_synchronous_request(janus_audiobridge_s
 		json_t *audiolevel_event = json_object_get(root, "audiolevel_event");
 		json_t *audio_active_packets = json_object_get(root, "audio_active_packets");
 		json_t *audio_level_average = json_object_get(root, "audio_level_average");
-		json_t *default_prebuffering = json_object_get(root, "default_prebuffering");
 		json_t *default_expectedloss = json_object_get(root, "default_expectedloss");
 		json_t *default_bitrate = json_object_get(root, "default_bitrate");
 		json_t *groups = json_object_get(root, "groups");
@@ -3191,13 +3165,6 @@ static json_t *janus_audiobridge_process_synchronous_request(janus_audiobridge_s
 				JANUS_LOG(LOG_WARN, "Invalid audio_level_average value provided, using default: %d\n",
 					audiobridge->audio_level_average);
 			}
-		}
-		audiobridge->default_prebuffering = default_prebuffering ?
-			json_integer_value(default_prebuffering) : DEFAULT_PREBUFFERING;
-		if(audiobridge->default_prebuffering > MAX_PREBUFFERING) {
-			audiobridge->default_prebuffering = DEFAULT_PREBUFFERING;
-			JANUS_LOG(LOG_WARN, "Invalid default_prebuffering value provided (too high), using default: %d\n",
-				audiobridge->default_prebuffering);
 		}
 		audiobridge->default_expectedloss = 0;
 		if(default_expectedloss != NULL) {
@@ -3364,10 +3331,6 @@ static json_t *janus_audiobridge_process_synchronous_request(janus_audiobridge_s
 					g_snprintf(value, BUFSIZ, "%d", audiobridge->audio_level_average);
 					janus_config_add(config, c, janus_config_item_create("audio_level_average", value));
 				}
-			}
-			if(audiobridge->default_prebuffering != DEFAULT_PREBUFFERING) {
-				g_snprintf(value, BUFSIZ, "%d", audiobridge->default_prebuffering);
-				janus_config_add(config, c, janus_config_item_create("default_prebuffering", value));
 			}
 			if(audiobridge->allow_plainrtp)
 				janus_config_add(config, c, janus_config_item_create("allow_rtp_participants", "yes"));
@@ -3545,10 +3508,6 @@ static json_t *janus_audiobridge_process_synchronous_request(janus_audiobridge_s
 					g_snprintf(value, BUFSIZ, "%d", audiobridge->audio_level_average);
 					janus_config_add(config, c, janus_config_item_create("audio_level_average", value));
 				}
-			}
-			if(audiobridge->default_prebuffering != DEFAULT_PREBUFFERING) {
-				g_snprintf(value, BUFSIZ, "%d", audiobridge->default_prebuffering);
-				janus_config_add(config, c, janus_config_item_create("default_prebuffering", value));
 			}
 			if(audiobridge->allow_plainrtp)
 				janus_config_add(config, c, janus_config_item_create("allow_rtp_participants", "yes"));
@@ -5988,7 +5947,6 @@ static void *janus_audiobridge_handler(void *data) {
 			json_t *display = json_object_get(root, "display");
 			const char *display_text = display ? json_string_value(display) : NULL;
 			json_t *muted = json_object_get(root, "muted");
-			json_t *prebuffer = json_object_get(root, "prebuffer");
 			json_t *gain = json_object_get(root, "volume");
 			json_t *spatial = json_object_get(root, "spatial_position");
 			json_t *bitrate = json_object_get(root, "bitrate");
@@ -6000,12 +5958,6 @@ static void *janus_audiobridge_handler(void *data) {
 			json_t *record = json_object_get(root, "record");
 			json_t *recfile = json_object_get(root, "filename");
 			json_t *gen_offer = json_object_get(root, "generate_offer");
-			uint prebuffer_count = prebuffer ? json_integer_value(prebuffer) : audiobridge->default_prebuffering;
-			if(prebuffer_count > MAX_PREBUFFERING) {
-				prebuffer_count = audiobridge->default_prebuffering;
-				JANUS_LOG(LOG_WARN, "Invalid prebuffering value provided (too high), using room default: %d\n",
-					audiobridge->default_prebuffering);
-			}
 			int volume = gain ? json_integer_value(gain) : 100;
 			int spatial_position = spatial ? json_integer_value(spatial) : 50;
 			int32_t opus_bitrate = audiobridge->default_bitrate;
@@ -6129,7 +6081,6 @@ static void *janus_audiobridge_handler(void *data) {
 			participant->admin = admin;
 			participant->display = display_text ? g_strdup(display_text) : NULL;
 			participant->muted = muted ? json_is_true(muted) : FALSE;	/* By default, everyone's unmuted when joining */
-			participant->prebuffer_count = prebuffer_count;
 			participant->volume_gain = volume;
 			participant->opus_complexity = complexity;
 			participant->opus_bitrate = opus_bitrate;
@@ -6456,7 +6407,6 @@ static void *janus_audiobridge_handler(void *data) {
 			if(error_code != 0)
 				goto error;
 			json_t *muted = json_object_get(root, "muted");
-			json_t *prebuffer = json_object_get(root, "prebuffer");
 			json_t *bitrate = json_object_get(root, "bitrate");
 			json_t *quality = json_object_get(root, "quality");
 			json_t *exploss = json_object_get(root, "expected_loss");
@@ -6468,22 +6418,6 @@ static void *janus_audiobridge_handler(void *data) {
 			json_t *group = json_object_get(root, "group");
 			json_t *gen_offer = json_object_get(root, "generate_offer");
 			json_t *update = json_object_get(root, "update");
-			if(prebuffer) {
-				uint prebuffer_count = json_integer_value(prebuffer);
-				if(prebuffer_count > MAX_PREBUFFERING) {
-					JANUS_LOG(LOG_WARN, "Invalid prebuffering value provided (too high), keeping previous value: %d\n",
-						participant->prebuffer_count);
-				} else if(prebuffer_count != participant->prebuffer_count) {
-					janus_mutex_lock(&participant->qmutex);
-					if(prebuffer_count < participant->prebuffer_count) {
-						/* We're switching to a shorter prebuffer, flush the jitter buffer */
-						if(participant->jitter)
-							jitter_buffer_reset(participant->jitter);
-					}
-					participant->prebuffer_count = prebuffer_count;
-					janus_mutex_unlock(&participant->qmutex);
-				}
-			}
 			if(gain)
 				participant->volume_gain = json_integer_value(gain);
 			if(bitrate) {
